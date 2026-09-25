@@ -1,0 +1,146 @@
+version: "3.8"
+
+# Full smart grid pipeline stack: Kafka (ingestion) + Postgres (storage/
+# serving) + Spark Structured Streaming (speed layer) + Airflow (batch
+# layer) + FastAPI (serving layer).
+#
+# Run from the project root:
+#   docker compose up -d --build
+
+services:
+  kafka:
+    image: apache/kafka:latest
+    container_name: grid-kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "grid-mini-project-cluster"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+    networks: [grid-net]
+
+  kafka-init-topics:
+    image: apache/kafka:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      "/opt/kafka/bin/kafka-topics.sh --create --if-not-exists
+      --bootstrap-server kafka:9092
+      --topic meter_readings --partitions 3 --replication-factor 1"
+    networks: [grid-net]
+
+  postgres:
+    image: postgres:16
+    container_name: grid-postgres
+    environment:
+      POSTGRES_DB: grid_db
+      POSTGRES_USER: grid
+      POSTGRES_PASSWORD: grid_pw
+    ports:
+      - "5434:5432"   # host 5434 -- avoids clashing with other local Postgres instances
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - grid-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U grid -d grid_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [grid-net]
+
+  spark-streaming:
+    build:
+      context: ./spark
+      dockerfile: Dockerfile
+    container_name: grid-spark-streaming
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      METER_TOPIC: meter_readings
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: grid_db
+      POSTGRES_USER: grid
+      POSTGRES_PASSWORD: grid_pw
+      WINDOW_DURATION: "1 minute"
+      WATERMARK_DELAY: "2 minutes"
+      CHECKPOINT_DIR: /tmp/spark-checkpoints
+      LOW_RENEWABLE_THRESHOLD: "0.05"
+      DLQ_ALERT_THRESHOLD: "5"
+    networks: [grid-net]
+
+  airflow:
+    image: apache/airflow:2.9.3-python3.11
+    container_name: grid-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://grid:grid_pw@postgres:5432/grid_db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      GRID_POSTGRES_HOST: postgres
+      GRID_POSTGRES_PORT: "5432"
+      GRID_POSTGRES_DB: grid_db
+      GRID_POSTGRES_USER: grid
+      GRID_POSTGRES_PASSWORD: grid_pw
+      GRID_TARIFF_DIR: /opt/airflow/data/raw/tariffs
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      _PIP_ADDITIONAL_REQUIREMENTS: "psycopg2-binary==2.9.9"
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/opt/airflow/data
+      - grid-airflow-data:/opt/airflow
+    ports:
+      - "8083:8080"   # host 8083 -- avoids clashing with other local Airflow stacks
+    command: airflow standalone
+    networks:
+      - grid-net
+
+  serving-api:
+    build:
+      context: ./serving
+      dockerfile: Dockerfile
+    container_name: grid-serving-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: grid_db
+      POSTGRES_USER: grid
+      POSTGRES_PASSWORD: grid_pw
+    ports:
+      - "8001:8000"   # host 8001 -- avoids clashing with the fleet-pipeline API on 8000
+    networks:
+      - grid-net
+
+networks:
+  grid-net:
+    driver: bridge
+
+volumes:
+  grid-postgres-data:
+  grid-airflow-data:
